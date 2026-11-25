@@ -1,1 +1,1 @@
-export { SimplyRouter } from "../../src/main"
+export { SimplyRouter as default } from "../../src/main"

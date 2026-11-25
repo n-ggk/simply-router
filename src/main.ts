@@ -1,28 +1,56 @@
 import type { Plugin } from "@opencode/plugin/promise/plugin"
-
-export const KEYS = [
-  "thk_live_conta1_key",
-  "thk_live_conta2_key",
-  "thk_live_conta3_key",
-]
+import { appendFileSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
+import { join } from "node:path"
 
 export const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
 
-const TOKEN_HARBOR_HOST = "tokenharbor.ai"
-const cooldowns = new Map<string, number>()
-let currentIndex = 0
+/** Default keys directory: one `<provider>.txt` per provider, one key per line. */
+export const DEFAULT_KEYS_DIR = join(homedir(), "tokenharbor", "keys")
 
-export function getNextAvailableKey(): { key: string; index: number } | null {
+/** Env name referenced by `opencode.json` as `{env:MY_API_KEY-<provider>}`. */
+const ENV_PREFIX = "MY_API_KEY-"
+
+/**
+ * Tracing is opt-in. Set `SIMPLY_ROUTER_TRACE=1` to append one line per native
+ * HTTP request and per retry decision. Override the path with
+ * `SIMPLY_ROUTER_TRACE_FILE`.
+ */
+const TRACE = process.env.SIMPLY_ROUTER_TRACE === "1" || process.env.SIMPLY_ROUTER_TRACE === "true"
+const TRACE_FILE = process.env.SIMPLY_ROUTER_TRACE_FILE ?? join(tmpdir(), "simply-router-trace.log")
+
+function trace(message: string): void {
+  if (!TRACE) return
+  try {
+    appendFileSync(TRACE_FILE, `${new Date().toISOString()} simply-router: ${message}\n`)
+  } catch {
+    // Tracing must never break request handling.
+  }
+}
+
+/** Round-robin key state for one provider. */
+export interface Rotator {
+  readonly keys: readonly string[]
+  readonly cooldowns: Map<string, number>
+  currentIndex: number
+}
+
+export function createRotator(keys: readonly string[]): Rotator {
+  return { keys, cooldowns: new Map(), currentIndex: 0 }
+}
+
+export function getNextAvailableKey(rotator: Rotator): { key: string; index: number } | null {
   const now = Date.now()
+  const { keys } = rotator
 
-  for (let offset = 0; offset < KEYS.length; offset++) {
-    const index = (currentIndex + offset) % KEYS.length
-    const key = KEYS[index]
-    const cooldownUntil = cooldowns.get(key)
+  for (let offset = 0; offset < keys.length; offset++) {
+    const index = (rotator.currentIndex + offset) % keys.length
+    const key = keys[index]
+    const cooldownUntil = rotator.cooldowns.get(key)
 
     if (cooldownUntil === undefined || now >= cooldownUntil) {
-      if (cooldownUntil !== undefined) cooldowns.delete(key)
-      currentIndex = (index + 1) % KEYS.length
+      if (cooldownUntil !== undefined) rotator.cooldowns.delete(key)
+      rotator.currentIndex = (index + 1) % keys.length
       return { key, index }
     }
   }
@@ -30,67 +58,199 @@ export function getNextAvailableKey(): { key: string; index: number } | null {
   return null
 }
 
-export function markKeyCooldown(key: string): void {
-  cooldowns.set(key, Date.now() + COOLDOWN_MS)
+export function markKeyCooldown(rotator: Rotator, key: string): void {
+  rotator.cooldowns.set(key, Date.now() + COOLDOWN_MS)
 }
 
-export function resetAllCooldowns(): void {
-  cooldowns.clear()
-  currentIndex = 0
+export function resetRotator(rotator: Rotator): void {
+  rotator.cooldowns.clear()
+  rotator.currentIndex = 0
 }
 
-function isTokenHarborRequest(request: Request): boolean {
+function isCoolingDown(rotator: Rotator, key: string, now: number = Date.now()): boolean {
+  const cooldownUntil = rotator.cooldowns.get(key)
+  return cooldownUntil !== undefined && now < cooldownUntil
+}
+
+export function hasAvailableKey(rotator: Rotator, now: number = Date.now()): boolean {
+  return rotator.keys.some((key) => !isCoolingDown(rotator, key, now))
+}
+
+/**
+ * Reads every `<provider>.txt` in `directory`. The file name (without `.txt`)
+ * is the provider id, matching `provider.<id>` in `opencode.json`; each non-empty
+ * line is a key. Providers without a file are absent from the result and are
+ * ignored by the plugin.
+ */
+export function loadProviderKeys(directory: string): Map<string, string[]> {
+  const providers = new Map<string, string[]>()
+
+  let entries: string[]
   try {
-    const hostname = new URL(request.url).hostname.toLowerCase()
-    return hostname === TOKEN_HARBOR_HOST || hostname.endsWith(`.${TOKEN_HARBOR_HOST}`)
+    entries = readdirSync(directory)
   } catch {
-    return false
+    return providers
   }
+
+  for (const entry of entries) {
+    if (!/\.txt$/i.test(entry)) continue
+
+    let text: string
+    try {
+      text = readFileSync(join(directory, entry), "utf8")
+    } catch {
+      continue
+    }
+
+    const keys = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+
+    if (keys.length > 0) providers.set(entry.replace(/\.txt$/i, ""), keys)
+  }
+
+  return providers
+}
+
+function isFailureStatus(status: number | undefined): status is 429 | 401 | 403 {
+  return status === 429 || status === 401 || status === 403
+}
+
+/**
+ * Providers report a per-account allowance exhaustion as a 429 with a long
+ * `retryAfterMs` and a message that may carry no status.
+ */
+function isRateLimitMessage(message: string): boolean {
+  return /rate ?limit|allowance|too many/i.test(message)
 }
 
 export const SimplyRouter: Plugin = {
   id: "simply-router",
   setup: async (ctx) => {
-    const selectedKeys = new WeakMap<Request, string>()
+    const options = (ctx.options ?? {}) as Record<string, unknown>
+    const storedDir = await ctx.storage.get("keysDir")
+    let keysDir =
+      (typeof options.keysDir === "string" ? options.keysDir : undefined) ??
+      (typeof storedDir === "string" ? storedDir : undefined) ??
+      process.env.SIMPLY_ROUTER_KEYS_DIR ??
+      DEFAULT_KEYS_DIR
+
+    const rotators = new Map<string, Rotator>()
+
+    /** (Re)loads every provider found in `directory` into the shared rotators map. */
+    const applyKeysDir = (directory: string): { providers: number; keys: number } => {
+      const providers = loadProviderKeys(directory)
+      rotators.clear()
+      let keyCount = 0
+
+      for (const [providerID, keys] of providers) {
+        rotators.set(providerID, createRotator(keys))
+        keyCount += keys.length
+        // Make the `{env:MY_API_KEY-<provider>}` reference in opencode.json resolve.
+        const envName = ENV_PREFIX + providerID
+        if (!process.env[envName]) process.env[envName] = keys[0]
+      }
+
+      return { providers: providers.size, keys: keyCount }
+    }
+
+    const initial = applyKeysDir(keysDir)
+    if (initial.providers === 0) {
+      console.warn(`simply-router: no "<provider>.txt" key files found in ${keysDir}; no provider will be rotated.`)
+    } else {
+      console.info(`simply-router: rotating ${initial.providers} provider(s), ${initial.keys} key(s) from ${keysDir}.`)
+    }
+
+    // Tracks the key in use for each in-flight native Request, so the response
+    // handler cools down the exact key that failed.
+    const selectedByRequest = new WeakMap<Request, { providerID: string; key: string; index: number }>()
+
+    const coolDown = (providerID: string, rotator: Rotator, failed: { key: string; index: number }, status: number): void => {
+      if (isCoolingDown(rotator, failed.key)) return
+      markKeyCooldown(rotator, failed.key)
+      console.warn(
+        `simply-router: ${providerID} key #${failed.index + 1} is cooling down for seven days (HTTP ${status}).`,
+      )
+    }
 
     const registrations = await Promise.all([
-      ctx.session.hook("http.request", async ({ request }) => {
-        if (!isTokenHarborRequest(request)) return
+      ctx.session.hook("http.request", async ({ model, kind, request }) => {
+        const rotator = rotators.get(model.providerID)
+        if (!rotator) return
 
-        const selected = getNextAvailableKey()
+        const selected = getNextAvailableKey(rotator)
         if (!selected) {
-          console.error("simply-router: all API keys are cooling down; use /simplyrouter reset.")
+          console.error(`simply-router: every ${model.providerID} key is cooling down; use /simplyrouter reset.`)
           return
         }
 
         request.headers.set("Authorization", `Bearer ${selected.key}`)
-        selectedKeys.set(request, selected.key)
-        console.info(`simply-router: selected key #${selected.index + 1}.`)
+        selectedByRequest.set(request, { providerID: model.providerID, ...selected })
+        console.info(`simply-router: ${model.providerID} selected key #${selected.index + 1}.`)
+        trace(`http.request provider=${model.providerID} kind=${kind} key=#${selected.index + 1}`)
       }),
-      ctx.session.hook("http.response", async ({ request, response }) => {
-        if (!isTokenHarborRequest(request)) return
-        if (response.status !== 429 && response.status !== 401 && response.status !== 403) return
+      // The failed key is benched here, before the retry is scheduled, so the
+      // retry's own http.request picks a different key.
+      ctx.session.hook("http.response", async ({ model, request, response }) => {
+        const rotator = rotators.get(model.providerID)
+        if (!rotator) return
+        if (!isFailureStatus(response.status)) return
 
-        const key = selectedKeys.get(request)
-        if (!key) return
+        const failed = selectedByRequest.get(request)
+        if (!failed || failed.providerID !== model.providerID) return
 
-        selectedKeys.delete(request)
-        markKeyCooldown(key)
-        console.warn(
-          `simply-router: key #${KEYS.indexOf(key) + 1} is cooling down for seven days (HTTP ${response.status}).`,
+        selectedByRequest.delete(request)
+        coolDown(model.providerID, rotator, failed, response.status)
+        trace(`http.response provider=${model.providerID} status=${response.status} cooled-#${failed.index + 1}`)
+      }),
+      // The retry hook is the last step before the next physical attempt. The
+      // provider asks for a long wait because the *account* is rate limited, but
+      // the retry runs on a different key, so the wait is pointless: retry at
+      // once. When no key is left, veto the retry. `attempt` starts at 2 for the
+      // first retry and there are rotator.keys.length keys to try.
+      ctx.session.hook("retry", (event) => {
+        const rotator = rotators.get(event.model.providerID)
+        if (!rotator) return
+
+        const status = event.error.status
+        const failure = isFailureStatus(status) || isRateLimitMessage(event.error.message)
+        trace(
+          `retry provider=${event.model.providerID} attempt=${event.attempt} status=${status ?? "none"} ` +
+            `type=${event.error.type} proposed-delay=${event.decision.retry ? event.decision.delay : "no-retry"}`,
         )
+
+        if (!failure) return
+
+        if (!hasAvailableKey(rotator)) {
+          event.decision = { retry: false }
+          console.warn(`simply-router: no ${event.model.providerID} key is available; the request will not be retried.`)
+          trace(`retry attempt=${event.attempt} -> veto (no key)`)
+          return
+        }
+
+        if (event.attempt <= rotator.keys.length) {
+          event.decision = { retry: true, delay: 0 }
+          console.info(`simply-router: retrying ${event.model.providerID} immediately on a fresh key.`)
+          trace(`retry attempt=${event.attempt} -> delay=0 (fresh key)`)
+          return
+        }
+
+        event.decision = { retry: false }
+        console.warn(`simply-router: every ${event.model.providerID} key failed for this request; giving up.`)
+        trace(`retry attempt=${event.attempt} -> veto (keys exhausted)`)
       }),
       ctx.tool.transform((tools) => {
         tools.add({
           name: "simplyrouter_reset",
-          description: "Clear all simply-router API-key cooldowns and restart key rotation.",
+          description: "Clear all simply-router API-key cooldowns and restart key rotation for every provider.",
           input: {
             type: "object",
             properties: {},
             additionalProperties: false,
           },
           execute: async () => {
-            resetAllCooldowns()
+            for (const rotator of rotators.values()) resetRotator(rotator)
             console.info("simply-router: all cooldowns cleared and key rotation reset.")
             return { content: "simply-router cooldowns cleared; key rotation reset." }
           },
@@ -99,15 +259,65 @@ export const SimplyRouter: Plugin = {
       ctx.command.transform((commands) => {
         commands.add({
           name: "simplyrouter",
-          description: "Manage simply-router API-key cooldowns. Usage: /simplyrouter reset",
-          execute: async ({ prompt }) => {
-            if (prompt.text.trim().toLowerCase() !== "reset") {
-              console.info("simply-router: use /simplyrouter reset to clear all key cooldowns.")
+          description: "Manage simply-router. Usage: /simplyrouter reset | /simplyrouter -keydirectory-set <path>",
+          execute: async ({ sessionID, prompt }) => {
+            const text = prompt.text.trim()
+
+            const match = /^-?keydirectory-set\b\s*(.*)$/i.exec(text)
+            if (match) {
+              const raw = match[1].trim().replace(/^"(.*)"$/, "$1")
+
+              if (!raw) {
+                await ctx.session.synthetic({
+                  sessionID,
+                  text: `simply-router: current key directory is ${keysDir}`,
+                })
+                return
+              }
+
+              let isDirectory = false
+              try {
+                isDirectory = statSync(raw).isDirectory()
+              } catch {
+                isDirectory = false
+              }
+              if (!isDirectory) {
+                await ctx.session.synthetic({
+                  sessionID,
+                  text: `simply-router: not a directory, nothing changed: ${raw}`,
+                })
+                return
+              }
+
+              keysDir = raw
+              const loaded = applyKeysDir(keysDir)
+              await ctx.storage.set("keysDir", raw)
+              console.info(
+                `simply-router: key directory set to ${raw} (${loaded.providers} provider(s), ${loaded.keys} key(s)).`,
+              )
+              await ctx.session.synthetic({
+                sessionID,
+                text:
+                  `simply-router: key directory set to ${raw} — ` +
+                  `${loaded.providers} provider(s), ${loaded.keys} key(s) loaded.`,
+              })
               return
             }
 
-            resetAllCooldowns()
-            console.info("simply-router: all cooldowns cleared and key rotation reset.")
+            if (text.toLowerCase() === "reset") {
+              for (const rotator of rotators.values()) resetRotator(rotator)
+              console.info("simply-router: all cooldowns cleared and key rotation reset.")
+              await ctx.session.synthetic({
+                sessionID,
+                text: "simply-router: all cooldowns cleared; key rotation reset.",
+              })
+              return
+            }
+
+            await ctx.session.synthetic({
+              sessionID,
+              text: "simply-router: usage — /simplyrouter reset | /simplyrouter -keydirectory-set <path>",
+            })
           },
         })
       }),
