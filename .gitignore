@@ -20,3 +20,6 @@ Thumbs.db
 
 # Planning artifacts
 docs/superpowers/
+
+# Local JavaScript provider tests
+javascript_testes/
