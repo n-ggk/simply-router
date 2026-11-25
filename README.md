@@ -1,7 +1,7 @@
 # simply-router
 
 An OpenCode plugin that rotates multiple API keys per provider. When the key in
-use hits its rate limit, simply-router benches it for seven days and retries the
+use hits its rate limit, simply-router puts it in a cooldown and retries the
 request immediately on a fresh key — so you keep working instead of waiting out
 the provider's per-account back-off.
 
@@ -15,20 +15,12 @@ provider it finds a key file for.
   key per line.
 - Injects `Authorization: Bearer <key>` on every request, using the next
   available key in round-robin order for that provider.
-- On an HTTP `429`, `401`, or `403`, benches the exact key that request used for
-  seven days: `7 * 24 * 60 * 60 * 1000` ms.
+- On an HTTP `429`, `401`, or `403`, benches the exact key that request used.
 - Drops the provider's per-account retry delay when a fresh key is available and
   retries at once, up to the retry cap.
 - Stops injecting a key and refuses to retry when every key for a provider is
   benched.
 - Never logs or returns a key — only the key index.
-
-## Requirements
-
-- [OpenCode](https://opencode.ai) with the v2 plugin API. Built and verified
-  against `@opencode/plugin` `2.4.1`.
-- [Bun](https://bun.sh) for `bun install`, `bun test`, and `bun run check`.
-- At least one `<provider>.txt` file with one key per line.
 
 ## Install
 
@@ -87,11 +79,11 @@ A local plugin path must be a directory; a path to a single file is ignored.
 
 Create the default keys directory and one file per provider. The file name
 (without `.txt`) must match the provider id in `opencode.json` — for the
-provider `tokenharbor`, the file is `tokenharbor.txt`.
+provider `<provider>`, the file is `<provider>.txt`.
 
 ```bash
-mkdir -p ~/tokenharbor/keys
-printf '%s\n' "key-account-a" "key-account-b" > ~/tokenharbor/keys/tokenharbor.txt
+mkdir -p ~/provider/keys
+printf '%s\n' "key-account-a" "key-account-b" > ~/provider/keys/<provider>.txt
 ```
 
 Rules:
@@ -112,18 +104,13 @@ plugin populates and keep the keys out of the file:
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "tokenharbor": {
-      "name": "Token Harbor",
+      "name": "Provider Example",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "https://tokenharbor.ai/v1",
-        "apiKey": "{env:MY_API_KEY-tokenharbor}"
+        "baseURL": "https://exampleprovider.ai/v1",
+        "apiKey": "{env:MY_API_KEY-<provider>}"
       },
-      "models": {
-        "deepseek-v4.1-flash:free": {
-          "name": "DeepSeek V4.1 Flash (Free)",
-          "limit": { "context": 1048576, "output": 32000 }
-        }
-      }
+      "models": {}
     }
   }
 }
