@@ -15,9 +15,12 @@ provider it finds a key file for.
   key per line.
 - Injects `Authorization: Bearer <key>` on every request, using the next
   available key in round-robin order for that provider.
-- On an HTTP `429`, `401`, or `403`, benches the exact key that request used.
-- Drops the provider's per-account retry delay when a fresh key is available and
-  retries at once, up to the retry cap.
+- Benches the exact key on `401`/`403` or a `429` explicitly identified as a
+  key-level limit.
+- Does not bench or retry another key for recognized account/model allowance
+  errors such as `free_tier_limit_reached`.
+- Rotates immediately for key-level failures, up to the retry cap; unclassified
+  `429`s keep the provider's original retry policy.
 - Stops injecting a key and refuses to retry when every key for a provider is
   benched.
 - Never logs or returns a key — only the key index.
@@ -103,7 +106,7 @@ plugin populates and keep the keys out of the file:
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "tokenharbor": {
+    "<provider>": {
       "name": "Provider Example",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
@@ -124,7 +127,7 @@ resolves. Rotation happens per request after that.
 
 | Setting | Plugin option | Environment variable | Default |
 | --- | --- | --- | --- |
-| Keys directory | `keysDir` | `SIMPLY_ROUTER_KEYS_DIR` | `~/tokenharbor/keys` |
+| Keys directory | `keysDir` | `SIMPLY_ROUTER_KEYS_DIR` | `~/<provider>/keys` |
 | Retry cap per request | `maxRetries` | `SIMPLY_ROUTER_MAX_RETRIES` | Number of keys for the provider |
 | Request tracing | — | `SIMPLY_ROUTER_TRACE=1` | Off |
 | Trace file | — | `SIMPLY_ROUTER_TRACE_FILE` | `<tmpdir>/simply-router-trace.log` |
@@ -176,40 +179,51 @@ An invalid path changes nothing. The same reset is available to the model as the
 ### What happens on a failing key
 
 1. `http.request` selects the next available key and sets `Authorization`.
-2. `http.response` sees `429`, `401`, or `403` and benches the key that request
-   used — before the retry is scheduled.
-3. `retry` replaces the provider's long per-account delay with
-   `{ retry: true, delay: 0 }` while another key is available, or vetoes the
-   retry with `{ retry: false }` when none is left.
+2. `http.response` inspects 429 error details and benches the key only for a
+   key-scoped failure; account/model allowance errors do not affect key cooldowns.
+3. `retry` rotates immediately for key-scoped failures when another key is
+   available. It vetoes retries for recognized account/model allowance errors;
+   unclassified 429s retain the provider's retry decision and delay.
 
 Typical log lines:
 
 ```text
-simply-router: rotating 1 provider(s), 3 key(s) from /home/me/tokenharbor/keys.
-simply-router: tokenharbor selected key #1.
-simply-router: tokenharbor key #1 is cooling down for seven days (HTTP 429).
-simply-router: retrying tokenharbor immediately on a fresh key.
-simply-router: every tokenharbor key is cooling down; use /simplyrouter reset.
+simply-router: rotating 1 provider(s), 3 key(s) from /home/me/<provider>/keys.
+simply-router: <provider> selected key #1.
+simply-router: <provider> key #1 is cooling down for seven days (HTTP 429).
+simply-router: retrying <provider> immediately on a fresh key.
+simply-router: every <provider> key is cooling down; use /simplyrouter reset.
+```
+
+For an account/model allowance response, the key is not cooled down and the
+request is not retried on another key:
+
+```text
+simply-router: <provider> account/model allowance is exhausted; not retrying.
 ```
 
 ### Tracing
 
 Set `SIMPLY_ROUTER_TRACE=1` to append one line per request and per retry
-decision. This is the way to confirm rotation is working on a real `429`:
+decision. This is the way to confirm how a `429` was classified:
 
 ```bash
 SIMPLY_ROUTER_TRACE=1 opencode
 ```
 
-Expected trace for a benched key:
+Expected trace for a key-level 429:
 
 ```text
-... http.request provider=tokenharbor kind=primary key=#1
-... http.response provider=tokenharbor status=429 cooled-#1
-... retry provider=tokenharbor attempt=2 status=429 proposed-delay=900000
+... http.request provider=<provider> kind=primary key=#1
+... http.response provider=<provider> status=429 scope=key cooled-#1
+... retry provider=<provider> attempt=2 status=429 scope=key proposed-delay=900000
 ... retry attempt=2 -> delay=0 (fresh key, max=3)
-... http.request provider=tokenharbor kind=primary key=#2
+... http.request provider=<provider> kind=primary key=#2
 ```
+
+For an account/model allowance 429, the trace reports `scope=account`,
+`skipped-cooldown`, and a vetoed retry. Unknown 429s report `scope=unknown` and
+leave the provider's retry policy unchanged.
 
 ## Notes and limitations
 
