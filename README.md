@@ -1,197 +1,261 @@
-simply-router — Especificação Consolidada
-1. Objetivo
-Criar um plugin local para o OpenCode chamado simply-router que faça rotação automática entre múltiplas API Keys do Token Harbor (tokenharbor.ai). Quando a key em uso esgotar seu limite semanal (retorno 429), ela entra em cooldown de 7 dias corridos e a próxima key disponível passa a ser usada. O plugin deve expor o comando /simplyrouter reset para limpar manualmente todos os cooldowns.
+# simply-router
 
-2. Requisitos decididos
-2.1 Funcionais
-ID	Requisito
-F1	Interceptar requisições destinadas ao host tokenharbor.ai e injetar Authorization: Bearer <key> com a key disponível atual
-F2	Rotação em round-robin: se a key atual falhar, avançar para a próxima key não bloqueada
-F3	Detectar esgotamento via status HTTP 429 (limite semanal excedido), além de 401/403 (key inválida ou sem permissão)
-F4	Ao detectar falha, marcar a key como em cooldown por 7 dias corridos (7 * 24 * 60 * 60 * 1000 ms)
-F5	Se todas as keys estiverem em cooldown, não injetar key e registrar erro no log
-F6	Registrar o comando /simplyrouter com subcomando reset que limpa todos os cooldowns e reinicia o índice para a primeira key
-F7	Suportar múltiplas contas Token Harbor (cada key pertence a uma conta distinta, pois o limite é compartilhado por conta)
-2.2 Não-funcionais
-ID	Requisito
-N1	Implementação simples, sem dependências externas obrigatórias
-N2	Estado de cooldown em memória (Map), perdido ao reiniciar o OpenCode (persistência fica como extensão futura)
-N3	Código em TypeScript, carregável pelo OpenCode via .opencode/plugins/
-N4	Comando /simplyrouter reset deve executar a limpeza real do estado, não apenas responder ao usuário
+An OpenCode plugin that rotates multiple API keys per provider. When the key in
+use hits its rate limit, simply-router benches it for seven days and retries the
+request immediately on a fresh key — so you keep working instead of waiting out
+the provider's per-account back-off.
 
-3. Decisões técnicas
+Each key belongs to a separate account (the weekly allowance is shared per
+account, not per key), and the plugin keeps its own round-robin state for every
+provider it finds a key file for.
 
-3.1 Hook principal: http.request
-O plugin usa o hook http.request do OpenCode para modificar event.request.headers antes do envio, substituindo o Authorization. A filtragem é feita verificando se event.request.url contém tokenharbor.ai.
+## What it does
 
-Limitação reconhecida: http.request não reenvia requisições que falharam. O retry automático depende do mecanismo nativo de retry do OpenCode (que reaciona http.request antes da próxima tentativa) ou de lógica adicional combinada com session.error. A versão inicial assume que o OpenCode reaciona http.request no retry; isso deve ser validado em teste (ver §5).
+- Loads one key file per provider from a keys directory: `<provider>.txt`, one
+  key per line.
+- Injects `Authorization: Bearer <key>` on every request, using the next
+  available key in round-robin order for that provider.
+- On an HTTP `429`, `401`, or `403`, benches the exact key that request used for
+  seven days: `7 * 24 * 60 * 60 * 1000` ms.
+- Drops the provider's per-account retry delay when a fresh key is available and
+  retries at once, up to the retry cap.
+- Stops injecting a key and refuses to retry when every key for a provider is
+  benched.
+- Never logs or returns a key — only the key index.
 
-3.2 Detecção de falha: session.error
-O hook session.error inspeciona status da resposta; se for 429, 401 ou 403, chama markKeyCooldown(currentKey) com o timestamp de expiração de 7 dias.
+## Requirements
 
-3.3 Comando /simplyrouter reset
-Registrado via config.command no hook config. Como config.command é um template de prompt (não código executável), o template orienta o modelo a chamar uma custom tool simplyrouter_reset, registrada no próprio plugin, cujo execute limpa o Map de cooldowns e zera currentIndex.
+- [OpenCode](https://opencode.ai) with the v2 plugin API. Built and verified
+  against `@opencode/plugin` `2.4.1`.
+- [Bun](https://bun.sh) for `bun install`, `bun test`, and `bun run check`.
+- At least one `<provider>.txt` file with one key per line.
 
-3.4 Alternativa considerada e descartada
-O padrão do plugin oc-zai-multi-account (hook em auth.loader + substituição de fetch) foi considerado como referência, mas descartado por ser mais complexo do que o necessário para o objetivo "simples para o OpenCode". O http.request atende ao caso de uso.
+## Install
 
-4. Estrutura do repositório
+### Project-local
 
-simply-router/
-├── src/
-│   └── main.ts                 # Lógica central (KEYS, COOLDOWN_MS, getNextAvailableKey, hooks, tool de reset)
-├── .opencode/
-│   ├── package.json            # (Opcional) dependências externas para o plugin
-│   └── plugins/
-│       └── shim.ts             # Reexporta SimplyRouter de src/main.ts
-├── test/
-│   ├── unit.test.ts            # Testes unitários (rotação, cooldown, reset)
-│   └── e2e.test.ts             # Testes de integração (OpenCode real)
-├── package.json                # Metadados do projeto, "type": "module", scripts
-└── tsconfig.json               # Configuração do TypeScript
+The recommended setup. Run OpenCode from the repository and it discovers
+`.opencode/plugins/shim.ts` automatically.
 
-4.1 Papel de cada arquivo
-src/main.ts: código completo do plugin (constantes, estado, funções auxiliares, SimplyRouter: Plugin).
+```bash
+git clone https://github.com/n-ggk/simply-router.git
+cd simply-router
+bun install
+```
 
-.opencode/plugins/shim.ts: export { SimplyRouter } from "../../src/main" — permite que o OpenCode carregue o plugin direto do repositório durante o desenvolvimento.
+Then [configure the provider](#configure) and start OpenCode from this
+directory:
 
-.opencode/package.json: declarado se houver dependências npm; o OpenCode roda bun install em .opencode/ na inicialização.
+```bash
+opencode
+```
 
-test/unit.test.ts: bun test sobre as funções puras (getNextAvailableKey, markKeyCooldown, resetAllCooldowns).
+### Global
 
-test/e2e.test.ts: dispara opencode via Bun.$ e valida troca de key no log real.
+Install once and use it from every project.
 
-package.json (raiz): "type": "module", scripts "test": "bun test", "dev": "opencode".
+```bash
+git clone https://github.com/n-ggk/simply-router.git ~/.config/opencode/simply-router
+cd ~/.config/opencode/simply-router && bun install
+```
 
-tsconfig.json: configuração para o editor e tsc --noEmit.
+Create the entry file OpenCode discovers under your config directory:
 
-5. Plano de testes
+```bash
+mkdir -p ~/.config/opencode/plugins
+```
 
-5.1 Testes unitários (sem rede)
-Caso	Entrada	Saída esperada
-T1	Nenhuma key em cooldown, currentIndex = 0	getNextAvailableKey() retorna KEYS[0]
-T2	KEYS[0] em cooldown	getNextAvailableKey() retorna KEYS[1]
-T3	Todas as keys em cooldown	getNextAvailableKey() retorna null
-T4	KEYS[0] em cooldown com timestamp expirado	getNextAvailableKey() retorna KEYS[0]
-T5	Após resetAllCooldowns()	cooldowns.size === 0 e currentIndex === 0
-T6	markKeyCooldown(key)	cooldowns.get(key) ≈ Date.now() + 7 dias
+```ts title="~/.config/opencode/plugins/simply-router.ts"
+export { SimplyRouter as default } from "../simply-router/src/main"
+```
 
-5.2 Teste de integração (e2e)
-Objetivo: confirmar que, após uma key entrar em cooldown, a próxima requisição usa outra key.
+Then [configure the provider](#configure) in `~/.config/opencode/opencode.json`.
+To load it from a location other than the default, point OpenCode at the plugin
+directory instead of relying on discovery:
 
-Preparação: reduzir temporariamente COOLDOWN_MS para 30_000 (30 s) em ambiente de teste, ou substituir uma das keys por uma string inválida para forçar 401.
-
-Passos:
-
-Iniciar OpenCode no diretório do repositório (opencode).
-
-Enviar uma mensagem qualquer que dispare requisição ao Token Harbor.
-
-Forçar falha: usar key inválida em KEYS[0] ou aguardar 429 real.
-
-Verificar no log (client.app.log ou ~/.local/share/opencode/log/) a mensagem simply-router: key #1 em cooldown.
-
-Enviar nova mensagem; o log deve indicar o uso de key #2 (adicionar log simply-router: usando key #N temporariamente).
-
-Digitar /simplyrouter reset; o modelo deve chamar simplyrouter_reset e o log deve confirmar a limpeza.
-
-Enviar nova mensagem; o log deve voltar a key #1.
-
-5.3 Teste de compatibilidade do hook
-Validar na versão real do OpenCode se event.request.headers.set está disponível e se http.request é reacionado em retry. Se não funcionar, adaptar para o padrão auth.loader + substituição de fetch (referência: oc-zai-multi-account).
-
-6. Premissas e riscos
-P1: As keys em KEYS pertencem a contas distintas do Token Harbor (o free tier compartilha limite por conta).
-
-P2: O Token Harbor autentica via header Authorization: Bearer <key>. Se usar outro header, ajustar event.request.headers.set.
-
-R1: O estado de cooldown é em memória; reiniciar o OpenCode perde os cooldowns. Extensão futura: persistir em ~/.config/opencode/simply-router-state.json.
-
-R2: O hook http.request pode não ser reacionado no retry dependendo da versão do OpenCode; validar em teste (§5.3).
-
-R3: /simplyrouter reset depende de o modelo seguir o template e chamar a tool; testar em §5.2.
-
-7. Código de referência (esqueleto de src/main.ts)
-typescript
-import type { Plugin } from "@opencode-ai/plugin"
-
-const KEYS = [
-  "thk_live_conta1_key",
-  "thk_live_conta2_key",
-  "thk_live_conta3_key",
-]
-const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
-const TOKEN_HARBOR_HOST = "tokenharbor.ai"
-
-const cooldowns = new Map<string, number>()
-let currentIndex = 0
-
-function getNextAvailableKey(): { key: string; index: number } | null {
-  const now = Date.now()
-  for (let i = 0; i < KEYS.length; i++) {
-    const idx = (currentIndex + i) % KEYS.length
-    const key = KEYS[idx]
-    const until = cooldowns.get(key)
-    if (!until || now >= until) {
-      currentIndex = idx
-      return { key, index: idx }
-    }
-  }
-  return null
+```jsonc title="~/.config/opencode/opencode.json"
+{
+  "plugins": ["~/.config/opencode/simply-router"]
 }
+```
 
-function markKeyCooldown(key: string) {
-  cooldowns.set(key, Date.now() + COOLDOWN_MS)
-}
+A local plugin path must be a directory; a path to a single file is ignored.
 
-function resetAllCooldowns() {
-  cooldowns.clear()
-  currentIndex = 0
-}
+## Configure
 
-export const SimplyRouter: Plugin = async ({ client }) => {
-  return {
-    config: async (config) => {
-      config.command = config.command || {}
-      config.command["simplyrouter"] = {
-        template: "Chame a ferramenta simplyrouter_reset para resetar todos os cooldowns do simply-router.",
-        description: "simply-router: '/simplyrouter reset' limpa todos os cooldowns.",
-      }
-    },
-    "http.request": async (event) => {
-      if (!event.request.url?.includes(TOKEN_HARBOR_HOST)) return
-      const selected = getNextAvailableKey()
-      if (selected) {
-        event.request.headers.set("Authorization", `Bearer ${selected.key}`)
-      } else {
-        await client.app.log({
-          level: "error",
-          message: "simply-router: todas as keys em cooldown. Use /simplyrouter reset.",
-        })
-      }
-    },
-    "session.error": async (input, output) => {
-      const err = output as any
-      const status = err?.status ?? err?.response?.status
-      if (status === 429 || status === 401 || status === 403) {
-        const currentKey = KEYS[currentIndex]
-        if (currentKey) {
-          markKeyCooldown(currentKey)
-          await client.app.log({
-            level: "warn",
-            message: `simply-router: key #${currentIndex + 1} em cooldown por 7 dias (status ${status}).`,
-          })
+### 1. Add your keys
+
+Create the default keys directory and one file per provider. The file name
+(without `.txt`) must match the provider id in `opencode.json` — for the
+provider `tokenharbor`, the file is `tokenharbor.txt`.
+
+```bash
+mkdir -p ~/tokenharbor/keys
+printf '%s\n' "key-account-a" "key-account-b" > ~/tokenharbor/keys/tokenharbor.txt
+```
+
+Rules:
+
+- One key per line; every non-empty line is a key, so comments are not
+  supported.
+- Providers without a matching `.txt` file are ignored by the plugin.
+- Keys must belong to **different accounts**. Keys from the same account share
+  the weekly limit and will all fail together.
+
+### 2. Point your provider at the plugin
+
+In `opencode.json` (or `opencode.jsonc`), reference the environment variable the
+plugin populates and keep the keys out of the file:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "tokenharbor": {
+      "name": "Token Harbor",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://tokenharbor.ai/v1",
+        "apiKey": "{env:MY_API_KEY-tokenharbor}"
+      },
+      "models": {
+        "deepseek-v4.1-flash:free": {
+          "name": "DeepSeek V4.1 Flash (Free)",
+          "limit": { "context": 1048576, "output": 32000 }
         }
       }
-    },
-    // Tool registrada para o comando /simplyrouter reset (implementação a completar
-    // de acordo com a API de custom tools da versão do OpenCode em uso)
+    }
   }
 }
+```
 
-8. Itens em aberto
-API exata de custom tools na versão do OpenCode em uso (necessária para concluir simplyrouter_reset).
+The plugin sets `MY_API_KEY-<provider>` at setup to the first key of that
+provider's file (when the variable is not already set), so the reference
+resolves. Rotation happens per request after that.
 
-Confirmar se http.request é reacionado em retry (define se o retry automático é "silencioso" ou requer lógica adicional).
+### 3. Options and environment variables
 
-Decidir se a persistência de cooldown em disco entra na versão inicial ou fica como extensão.
+| Setting | Plugin option | Environment variable | Default |
+| --- | --- | --- | --- |
+| Keys directory | `keysDir` | `SIMPLY_ROUTER_KEYS_DIR` | `~/tokenharbor/keys` |
+| Retry cap per request | `maxRetries` | `SIMPLY_ROUTER_MAX_RETRIES` | Number of keys for the provider |
+| Request tracing | — | `SIMPLY_ROUTER_TRACE=1` | Off |
+| Trace file | — | `SIMPLY_ROUTER_TRACE_FILE` | `<tmpdir>/simply-router-trace.log` |
+
+The keys directory precedence is: plugin option `keysDir` > value stored by
+`/simplyrouter -keydirectory-set` > `SIMPLY_ROUTER_KEYS_DIR` > the default.
+
+Environment variables are the simplest way to set either value:
+
+```bash
+export SIMPLY_ROUTER_KEYS_DIR="$HOME/work/keys"
+export SIMPLY_ROUTER_MAX_RETRIES=4
+opencode
+```
+
+When you load the plugin through `opencode.json`, pass the same values as
+`options` in the plugin entry. The entry shape is the documented object form:
+
+```jsonc title="opencode.json"
+{
+  "plugins": [
+    {
+      "package": "simply-router",
+      "options": { "keysDir": "~/work/keys", "maxRetries": 4 }
+    }
+  ]
+}
+```
+
+`maxRetries` caps how many attempt numbers a single request may reach. The
+default is the provider's key count, which is enough for the request to try
+every key once; lowering it can give up while keys are still available.
+
+## Usage
+
+Use OpenCode normally. Key selection, benching, and retry are automatic.
+
+### Commands
+
+| Command | Effect |
+| --- | --- |
+| `/simplyrouter reset` | Clears every cooldown and restarts rotation at the first key. |
+| `/simplyrouter -keydirectory-set <path>` | Validates and switches the keys directory, reloads every provider, and stores the choice. |
+| `/simplyrouter -keydirectory-set` | Prints the current keys directory. |
+
+An invalid path changes nothing. The same reset is available to the model as the
+`simplyrouter_reset` tool.
+
+### What happens on a failing key
+
+1. `http.request` selects the next available key and sets `Authorization`.
+2. `http.response` sees `429`, `401`, or `403` and benches the key that request
+   used — before the retry is scheduled.
+3. `retry` replaces the provider's long per-account delay with
+   `{ retry: true, delay: 0 }` while another key is available, or vetoes the
+   retry with `{ retry: false }` when none is left.
+
+Typical log lines:
+
+```text
+simply-router: rotating 1 provider(s), 3 key(s) from /home/me/tokenharbor/keys.
+simply-router: tokenharbor selected key #1.
+simply-router: tokenharbor key #1 is cooling down for seven days (HTTP 429).
+simply-router: retrying tokenharbor immediately on a fresh key.
+simply-router: every tokenharbor key is cooling down; use /simplyrouter reset.
+```
+
+### Tracing
+
+Set `SIMPLY_ROUTER_TRACE=1` to append one line per request and per retry
+decision. This is the way to confirm rotation is working on a real `429`:
+
+```bash
+SIMPLY_ROUTER_TRACE=1 opencode
+```
+
+Expected trace for a benched key:
+
+```text
+... http.request provider=tokenharbor kind=primary key=#1
+... http.response provider=tokenharbor status=429 cooled-#1
+... retry provider=tokenharbor attempt=2 status=429 proposed-delay=900000
+... retry attempt=2 -> delay=0 (fresh key, max=3)
+... http.request provider=tokenharbor kind=primary key=#2
+```
+
+## Notes and limitations
+
+- **Cooldowns live in memory.** Restarting OpenCode clears every cooldown and
+  resets rotation. Only the keys directory is persisted.
+- **Seven days is fixed.** The cooldown duration is a constant, not an option.
+- **Only the key that failed is benched.** A key is never benched because a
+  different provider or request failed.
+- **Rotation is per provider id.** Any provider with a `<provider>.txt` file is
+  rotated without code changes.
+
+## Development
+
+```bash
+bun install    # dependencies
+bun test       # unit tests for rotation, cooldown, reset, and key loading
+bun run check  # tsc --noEmit
+```
+
+`bun test` covers the pure helpers in `src/main.ts`; the hooks themselves are
+verified manually with `SIMPLY_ROUTER_TRACE=1` (see [Tracing](#tracing)).
+
+## Repository layout
+
+```text
+simply-router/
+├── src/main.ts              # Plugin: key loading, rotation state, hooks, commands
+├── .opencode/plugins/shim.ts  # Re-exports the plugin for project-local discovery
+├── test/unit.test.ts        # Bun unit tests
+├── package.json             # Scripts and dev dependencies
+└── tsconfig.json            # TypeScript configuration (noEmit)
+```
+
+## License
+
+[MIT](./LICENSE) © n-ggk
