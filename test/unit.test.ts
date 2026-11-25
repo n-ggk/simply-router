@@ -9,6 +9,7 @@ import {
   hasAvailableKey,
   loadProviderKeys,
   markKeyCooldown,
+  parseMaxRetries,
   resetRotator,
 } from "../src/main"
 
@@ -94,6 +95,22 @@ describe("simply-router key rotation", () => {
     now += COOLDOWN_MS
 
     expect(hasAvailableKey(rotator)).toBe(true)
+  })
+})
+
+describe("simply-router retry cap", () => {
+  test("parseMaxRetries accepts positive integers", () => {
+    expect(parseMaxRetries(3)).toBe(3)
+    expect(parseMaxRetries("5")).toBe(5)
+    expect(parseMaxRetries("2.9")).toBe(2)
+  })
+
+  test("parseMaxRetries rejects missing or non-positive values", () => {
+    expect(parseMaxRetries(0)).toBeUndefined()
+    expect(parseMaxRetries(-1)).toBeUndefined()
+    expect(parseMaxRetries("abc")).toBeUndefined()
+    expect(parseMaxRetries(undefined)).toBeUndefined()
+    expect(parseMaxRetries(null)).toBeUndefined()
   })
 })
 

@@ -125,10 +125,20 @@ function isRateLimitMessage(message: string): boolean {
   return /rate ?limit|allowance|too many/i.test(message)
 }
 
+/**
+ * Reads a positive integer retry cap. Returns `undefined` for missing or invalid
+ * values, so the caller falls back to the provider's key count.
+ */
+export function parseMaxRetries(value: unknown): number | undefined {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined
+}
+
 export const SimplyRouter: Plugin = {
   id: "simply-router",
   setup: async (ctx) => {
     const options = (ctx.options ?? {}) as Record<string, unknown>
+    const configuredMaxRetries = parseMaxRetries(options.maxRetries ?? process.env.SIMPLY_ROUTER_MAX_RETRIES)
     const storedDir = await ctx.storage.get("keysDir")
     let keysDir =
       (typeof options.keysDir === "string" ? options.keysDir : undefined) ??
@@ -229,10 +239,13 @@ export const SimplyRouter: Plugin = {
           return
         }
 
-        if (event.attempt <= rotator.keys.length) {
+        // One immediate retry per key by default (attempts 2..keys.length); a
+        // configured `maxRetries` overrides that cap.
+        const maxAttempts = configuredMaxRetries ?? rotator.keys.length
+        if (event.attempt <= maxAttempts) {
           event.decision = { retry: true, delay: 0 }
           console.info(`simply-router: retrying ${event.model.providerID} immediately on a fresh key.`)
-          trace(`retry attempt=${event.attempt} -> delay=0 (fresh key)`)
+          trace(`retry attempt=${event.attempt} -> delay=0 (fresh key, max=${maxAttempts})`)
           return
         }
 
