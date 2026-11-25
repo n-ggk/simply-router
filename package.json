@@ -1,0 +1,15 @@
+{
+  "name": "simply-router",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "check": "tsc --noEmit",
+    "dev": "bun --watch src/main.ts"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.4.1",
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
