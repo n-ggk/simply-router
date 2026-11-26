@@ -1,9 +1,9 @@
 # simply-router
 
 An OpenCode plugin that rotates multiple API keys per provider. When the key in
-use hits its rate limit, simply-router puts it in a cooldown and retries the
-request immediately on a fresh key — so you keep working instead of waiting out
-the provider's per-account back-off.
+use hits its rate limit or is rejected, simply-router puts it in a cooldown and
+retries the request immediately on a fresh key — so you keep working instead of
+waiting out the provider's per-account back-off.
 
 Each key belongs to a separate account (the weekly allowance is shared per
 account, not per key), and the plugin keeps its own round-robin state for every
@@ -15,12 +15,9 @@ provider it finds a key file for.
   key per line.
 - Injects `Authorization: Bearer <key>` on every request, using the next
   available key in round-robin order for that provider.
-- Benches the exact key on `401`/`403` or a `429` explicitly identified as a
-  key-level limit.
-- Does not bench or retry another key for recognized account/model allowance
-  errors such as `free_tier_limit_reached`.
-- Rotates immediately for key-level failures, up to the retry cap; unclassified
-  `429`s keep the provider's original retry policy.
+- Benches the exact key on a `401`, `403`, or `429` response.
+- Rotates immediately on any of those failures, up to the retry cap, and gives
+  up only when the cap is reached or every key is benched.
 - Stops injecting a key and refuses to retry when every key for a provider is
   benched.
 - Never logs or returns a key — only the key index.
@@ -85,8 +82,8 @@ Create the default keys directory and one file per provider. The file name
 provider `<provider>`, the file is `<provider>.txt`.
 
 ```bash
-mkdir -p ~/provider/keys
-printf '%s\n' "key-account-a" "key-account-b" > ~/provider/keys/<provider>.txt
+mkdir -p ~/tokenharbor/keys
+printf '%s\n' "key-account-a" "key-account-b" > ~/tokenharbor/keys/<provider>.txt
 ```
 
 Rules:
@@ -127,7 +124,7 @@ resolves. Rotation happens per request after that.
 
 | Setting | Plugin option | Environment variable | Default |
 | --- | --- | --- | --- |
-| Keys directory | `keysDir` | `SIMPLY_ROUTER_KEYS_DIR` | `~/<provider>/keys` |
+| Keys directory | `keysDir` | `SIMPLY_ROUTER_KEYS_DIR` | `~/tokenharbor/keys` |
 | Retry cap per request | `maxRetries` | `SIMPLY_ROUTER_MAX_RETRIES` | Number of keys for the provider |
 | Request tracing | — | `SIMPLY_ROUTER_TRACE=1` | Off |
 | Trace file | — | `SIMPLY_ROUTER_TRACE_FILE` | `<tmpdir>/simply-router-trace.log` |
@@ -179,51 +176,53 @@ An invalid path changes nothing. The same reset is available to the model as the
 ### What happens on a failing key
 
 1. `http.request` selects the next available key and sets `Authorization`.
-2. `http.response` inspects 429 error details and benches the key only for a
-   key-scoped failure; account/model allowance errors do not affect key cooldowns.
-3. `retry` rotates immediately for key-scoped failures when another key is
-   available. It vetoes retries for recognized account/model allowance errors;
-   unclassified 429s retain the provider's retry decision and delay.
+2. `http.response` benches the exact key that failed on a `401`, `403`, or `429`.
+3. `retry` rotates immediately when another key is available: it treats a
+   `401`/`403`/`429` status — or an error message matching `rate limit`,
+   `allowance`, or `too many` — as the failure signal and overrides the
+   provider's delay to `0`. It vetoes the retry once the attempt cap is reached
+   or every key is benched. Errors it does not recognize keep the provider's
+   retry policy unchanged.
 
 Typical log lines:
 
 ```text
-simply-router: rotating 1 provider(s), 3 key(s) from /home/me/<provider>/keys.
+simply-router: rotating 1 provider(s), 3 key(s) from /home/me/tokenharbor/keys.
 simply-router: <provider> selected key #1.
 simply-router: <provider> key #1 is cooling down for seven days (HTTP 429).
 simply-router: retrying <provider> immediately on a fresh key.
 simply-router: every <provider> key is cooling down; use /simplyrouter reset.
 ```
 
-For an account/model allowance response, the key is not cooled down and the
-request is not retried on another key:
-
-```text
-simply-router: <provider> account/model allowance is exhausted; not retrying.
-```
+For an account/model allowance response, rotating to another key does not help
+when the keys share the account: every key fails the same way, so the request is
+retried only up to the attempt cap and then given up.
 
 ### Tracing
 
-Set `SIMPLY_ROUTER_TRACE=1` to append one line per request and per retry
-decision. This is the way to confirm how a `429` was classified:
+Set `SIMPLY_ROUTER_TRACE=1` to append one line per native HTTP request and per
+retry decision. This is the way to confirm how a failure was handled:
 
 ```bash
 SIMPLY_ROUTER_TRACE=1 opencode
 ```
 
-Expected trace for a key-level 429:
+Expected trace for a `429` on key #1:
 
 ```text
 ... http.request provider=<provider> kind=primary key=#1
-... http.response provider=<provider> status=429 scope=key cooled-#1
-... retry provider=<provider> attempt=2 status=429 scope=key proposed-delay=900000
+... http.response provider=<provider> status=429 cooled-#1
+... retry provider=<provider> attempt=2 status=429 type=<error-type> proposed-delay=900000
 ... retry attempt=2 -> delay=0 (fresh key, max=3)
 ... http.request provider=<provider> kind=primary key=#2
 ```
 
-For an account/model allowance 429, the trace reports `scope=account`,
-`skipped-cooldown`, and a vetoed retry. Unknown 429s report `scope=unknown` and
-leave the provider's retry policy unchanged.
+Every retry decision is traced. The `retry` line reports the provider's
+`proposed-delay` (often `retryAfterMs`); the following line shows the override to
+`delay=0` when a fresh key is available, or a veto when none is. Only recognized
+failures — a `401`/`403`/`429` status or a message matching `rate limit`,
+`allowance`, or `too many` — get the override; anything else keeps the provider's
+retry policy unchanged.
 
 ## Notes and limitations
 
