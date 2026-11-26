@@ -11,8 +11,8 @@ provider it finds a key file for.
 
 ## What it does
 
-- Loads one key file per provider from a keys directory: `<provider>.txt`, one
-  key per line.
+- Loads one TypeScript key file per provider from a keys directory:
+  `<provider>.ts`.
 - Injects `Authorization: Bearer <key>` on every request, using the next
   available key in round-robin order for that provider.
 - Benches the exact key on a `401`, `403`, or `429` response.
@@ -78,19 +78,31 @@ A local plugin path must be a directory; a path to a single file is ignored.
 ### 1. Add your keys
 
 Create the default keys directory and one file per provider. The file name
-(without `.txt`) must match the provider id in `opencode.json` — for the
-provider `<provider>`, the file is `<provider>.txt`.
-
+(without `.ts`) must match the provider id in `opencode.json` — for the
+provider `<provider>`, the file is `<provider>.ts`.
 ```bash
 mkdir -p ~/tokenharbor/keys
-printf '%s\n' "key-account-a" "key-account-b" > ~/tokenharbor/keys/<provider>.txt
 ```
-
+Create `~/tokenharbor/keys/<provider>.ts` with one entry per account:
+```ts
+export default [
+  { "key": "key-account-a", "status": "free" },
+  { "key": "key-account-b", "status": "free" }
+] as const;
+```
+To migrate an existing `<provider>.txt`:
+1. Create `<provider>.ts` in the same keys directory.
+2. Convert each non-empty line into an entry with `"status": "free"`. Starting
+   every key as free is recommended; the plugin will add cooldown timestamps
+   when it detects a failed key.
+3. Verify the `.ts` file loads, then remove the old `.txt` file. `.txt` files
+   are ignored by the plugin.
 Rules:
-
-- One key per line; every non-empty line is a key, so comments are not
-  supported.
-- Providers without a matching `.txt` file are ignored by the plugin.
+- Each entry has a `key` and a `status` of `"free"` or `"cooldown"`.
+- Cooldown entries also have a `cooldownUntil` ISO timestamp. The plugin
+  maintains this field and changes expired entries back to `"free"` before
+  selecting a key; expired keys are not tested against the provider.
+- Providers without a matching `.ts` file are ignored by the plugin.
 - Keys must belong to **different accounts**. Keys from the same account share
   the weekly limit and will all fail together.
 
@@ -226,12 +238,12 @@ retry policy unchanged.
 
 ## Notes and limitations
 
-- **Cooldowns live in memory.** Restarting OpenCode clears every cooldown and
-  resets rotation. Only the keys directory is persisted.
+- **Cooldowns are saved in each provider's `.ts` file.** Restarting OpenCode
+  keeps cooldowns; expired entries are returned to `"free"` on the next request.
 - **Seven days is fixed.** The cooldown duration is a constant, not an option.
 - **Only the key that failed is benched.** A key is never benched because a
   different provider or request failed.
-- **Rotation is per provider id.** Any provider with a `<provider>.txt` file is
+- **Rotation is per provider id.** Any provider with a `<provider>.ts` file is
   rotated without code changes.
 
 ## Development

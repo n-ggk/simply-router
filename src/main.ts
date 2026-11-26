@@ -1,12 +1,19 @@
 import type { Plugin } from "@opencode/plugin/promise/plugin"
-import { appendFileSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 
 export const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
 
-/** Default keys directory: one `<provider>.txt` per provider, one key per line. */
+/** Default keys directory: one `<provider>.ts` file per provider. */
 export const DEFAULT_KEYS_DIR = join(homedir(), "tokenharbor", "keys")
+
+type ProviderKeyRecord =
+  | { key: string; status: "free" }
+  | { key: string; status: "cooldown"; cooldownUntil: string }
+
+const KEY_FILE_PREFIX = "export default "
+const KEY_FILE_SUFFIX = " as const;"
 
 /** Env name referenced by `opencode.json` as `{env:MY_API_KEY-<provider>}`. */
 const ENV_PREFIX = "MY_API_KEY-"
@@ -30,7 +37,7 @@ function trace(message: string): void {
 
 /** Round-robin key state for one provider. */
 export interface Rotator {
-  readonly keys: readonly string[]
+  keys: readonly string[]
   readonly cooldowns: Map<string, number>
   currentIndex: number
 }
@@ -76,41 +83,115 @@ export function hasAvailableKey(rotator: Rotator, now: number = Date.now()): boo
   return rotator.keys.some((key) => !isCoolingDown(rotator, key, now))
 }
 
-/**
- * Reads every `<provider>.txt` in `directory`. The file name (without `.txt`)
- * is the provider id, matching `provider.<id>` in `opencode.json`; each non-empty
- * line is a key. Providers without a file are absent from the result and are
- * ignored by the plugin.
- */
-export function loadProviderKeys(directory: string): Map<string, string[]> {
+function readProviderKeyRecords(filePath: string): ProviderKeyRecord[] {
+  const contents = readFileSync(filePath, "utf8").trim()
+  if (!contents.startsWith(KEY_FILE_PREFIX) || !contents.endsWith(KEY_FILE_SUFFIX)) {
+    throw new Error(`expected a TypeScript key file using "${KEY_FILE_PREFIX}[...]${KEY_FILE_SUFFIX}"`)
+  }
+
+  const serialized = contents.slice(KEY_FILE_PREFIX.length, -KEY_FILE_SUFFIX.length).trim()
+  const parsed: unknown = JSON.parse(serialized)
+  if (!Array.isArray(parsed)) throw new Error("expected the default export to be an array")
+
+  return parsed.map((entry: unknown, index: number): ProviderKeyRecord => {
+    if (typeof entry !== "object" || entry === null || !("key" in entry) || !("status" in entry)) {
+      throw new Error(`invalid key entry at index ${index}`)
+    }
+
+    if (typeof entry.key !== "string" || entry.key.trim().length === 0) {
+      throw new Error(`invalid key at index ${index}`)
+    }
+    if (entry.status === "free") return { key: entry.key, status: "free" }
+    if (
+      entry.status === "cooldown" &&
+      "cooldownUntil" in entry &&
+      typeof entry.cooldownUntil === "string" &&
+      Number.isFinite(Date.parse(entry.cooldownUntil))
+    ) {
+      return { key: entry.key, status: "cooldown", cooldownUntil: entry.cooldownUntil }
+    }
+    throw new Error(`invalid status or cooldownUntil at index ${index}`)
+  })
+}
+
+function writeProviderKeyRecords(filePath: string, records: readonly ProviderKeyRecord[]): void {
+  writeFileSync(filePath, `${KEY_FILE_PREFIX}${JSON.stringify(records, null, 2)}${KEY_FILE_SUFFIX}\n`, "utf8")
+}
+
+function loadProviderKeyFile(filePath: string, now: number): string[] {
+  let records = readProviderKeyRecords(filePath)
+  let expired = false
+  const refreshed = records.map((record) => {
+    if (record.status !== "cooldown" || Date.parse(record.cooldownUntil) > now) return record
+    expired = true
+    return { key: record.key, status: "free" } satisfies ProviderKeyRecord
+  })
+
+  if (expired) {
+    writeProviderKeyRecords(filePath, refreshed)
+    records = readProviderKeyRecords(filePath)
+  }
+
+  return records.filter((record) => record.status === "free").map((record) => record.key)
+}
+
+/** Reads each `<provider>.ts` file and returns only keys whose status is free. */
+export function loadProviderKeys(directory: string, now: number = Date.now()): Map<string, string[]> {
   const providers = new Map<string, string[]>()
 
   let entries: string[]
   try {
     entries = readdirSync(directory)
-  } catch {
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return providers
+    }
+    console.error(`simply-router: failed to read keys directory ${directory}: ${error}`)
     return providers
   }
 
   for (const entry of entries) {
-    if (!/\.txt$/i.test(entry)) continue
-
-    let text: string
+    if (!/\.ts$/i.test(entry)) continue
+    const providerID = entry.replace(/\.ts$/i, "")
     try {
-      text = readFileSync(join(directory, entry), "utf8")
-    } catch {
-      continue
+      providers.set(providerID, loadProviderKeyFile(join(directory, entry), now))
+    } catch (error) {
+      console.error(`simply-router: failed to load ${entry}: ${error}`)
+      providers.set(providerID, [])
     }
-
-    const keys = text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-
-    if (keys.length > 0) providers.set(entry.replace(/\.txt$/i, ""), keys)
   }
 
   return providers
+}
+
+export function persistProviderKeyCooldown(
+  directory: string,
+  providerID: string,
+  key: string,
+  now: number = Date.now(),
+): void {
+  const filePath = join(directory, `${providerID}.ts`)
+  const records = readProviderKeyRecords(filePath)
+  let found = false
+  const cooldownUntil = new Date(now + COOLDOWN_MS).toISOString()
+  const updated = records.map((record) => {
+    if (record.key !== key) return record
+    found = true
+    return { key: record.key, status: "cooldown", cooldownUntil } satisfies ProviderKeyRecord
+  })
+  if (!found) throw new Error(`key was not found in ${filePath}`)
+  writeProviderKeyRecords(filePath, updated)
+}
+
+export function resetProviderKeyFiles(directory: string): void {
+  for (const entry of readdirSync(directory).filter((name) => /\.ts$/i.test(name))) {
+    const filePath = join(directory, entry)
+    const records = readProviderKeyRecords(filePath)
+    writeProviderKeyRecords(
+      filePath,
+      records.map((record) => ({ key: record.key, status: "free" })),
+    )
+  }
 }
 
 function isFailureStatus(status: number | undefined): status is 429 | 401 | 403 {
@@ -159,15 +240,37 @@ export const SimplyRouter: Plugin = {
         keyCount += keys.length
         // Make the `{env:MY_API_KEY-<provider>}` reference in opencode.json resolve.
         const envName = ENV_PREFIX + providerID
-        if (!process.env[envName]) process.env[envName] = keys[0]
+        if (keys[0] && !process.env[envName]) process.env[envName] = keys[0]
       }
 
       return { providers: providers.size, keys: keyCount }
     }
 
+    const refreshProviderKeys = (providerID: string, rotator: Rotator): void => {
+      try {
+        rotator.keys = loadProviderKeyFile(join(keysDir, `${providerID}.ts`), Date.now())
+        if (rotator.keys.length > 0) rotator.currentIndex %= rotator.keys.length
+        else rotator.currentIndex = 0
+      } catch (error) {
+        rotator.keys = []
+        rotator.currentIndex = 0
+        console.error(`simply-router: failed to refresh ${providerID}.ts: ${error}`)
+      }
+    }
+
+    const resetAllCooldowns = (): void => {
+      try {
+        resetProviderKeyFiles(keysDir)
+        applyKeysDir(keysDir)
+      } catch (error) {
+        for (const rotator of rotators.values()) resetRotator(rotator)
+        console.error(`simply-router: failed to reset key files in ${keysDir}: ${error}`)
+      }
+    }
+
     const initial = applyKeysDir(keysDir)
     if (initial.providers === 0) {
-      console.warn(`simply-router: no "<provider>.txt" key files found in ${keysDir}; no provider will be rotated.`)
+      console.warn(`simply-router: no "<provider>.ts" key files found in ${keysDir}; no provider will be rotated.`)
     } else {
       console.info(`simply-router: rotating ${initial.providers} provider(s), ${initial.keys} key(s) from ${keysDir}.`)
     }
@@ -179,6 +282,11 @@ export const SimplyRouter: Plugin = {
     const coolDown = (providerID: string, rotator: Rotator, failed: { key: string; index: number }, status: number): void => {
       if (isCoolingDown(rotator, failed.key)) return
       markKeyCooldown(rotator, failed.key)
+      try {
+        persistProviderKeyCooldown(keysDir, providerID, failed.key)
+      } catch (error) {
+        console.error(`simply-router: failed to persist cooldown for ${providerID} key #${failed.index + 1}: ${error}`)
+      }
       console.warn(
         `simply-router: ${providerID} key #${failed.index + 1} is cooling down for seven days (HTTP ${status}).`,
       )
@@ -188,9 +296,11 @@ export const SimplyRouter: Plugin = {
       ctx.session.hook("http.request", async ({ model, kind, request }) => {
         const rotator = rotators.get(model.providerID)
         if (!rotator) return
+        refreshProviderKeys(model.providerID, rotator)
 
         const selected = getNextAvailableKey(rotator)
         if (!selected) {
+          request.headers.delete("Authorization")
           console.error(`simply-router: every ${model.providerID} key is cooling down; use /simplyrouter reset.`)
           return
         }
@@ -222,6 +332,7 @@ export const SimplyRouter: Plugin = {
       ctx.session.hook("retry", (event) => {
         const rotator = rotators.get(event.model.providerID)
         if (!rotator) return
+        refreshProviderKeys(event.model.providerID, rotator)
 
         const status = event.error.status
         const failure = isFailureStatus(status) || isRateLimitMessage(event.error.message)
@@ -263,7 +374,7 @@ export const SimplyRouter: Plugin = {
             additionalProperties: false,
           },
           execute: async () => {
-            for (const rotator of rotators.values()) resetRotator(rotator)
+            resetAllCooldowns()
             console.info("simply-router: all cooldowns cleared and key rotation reset.")
             return { content: "simply-router cooldowns cleared; key rotation reset." }
           },
@@ -318,7 +429,7 @@ export const SimplyRouter: Plugin = {
             }
 
             if (text.toLowerCase() === "reset") {
-              for (const rotator of rotators.values()) resetRotator(rotator)
+              resetAllCooldowns()
               console.info("simply-router: all cooldowns cleared and key rotation reset.")
               await ctx.session.synthetic({
                 sessionID,

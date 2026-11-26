@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -10,10 +10,16 @@ import {
   loadProviderKeys,
   markKeyCooldown,
   parseMaxRetries,
+  persistProviderKeyCooldown,
+  resetProviderKeyFiles,
   resetRotator,
 } from "../src/main"
 
 const KEYS = ["key-0", "key-1", "key-2"]
+
+function writeKeyFile(directory: string, provider: string, records: unknown[]): void {
+  writeFileSync(join(directory, `${provider}.ts`), `export default ${JSON.stringify(records, null, 2)} as const;\n`, "utf8")
+}
 
 describe("simply-router key rotation", () => {
   let now: number
@@ -115,16 +121,76 @@ describe("simply-router retry cap", () => {
 })
 
 describe("simply-router provider key loading", () => {
-  test("reads <provider>.txt, one key per line, and ignores other files", () => {
+  test("reads free keys from <provider>.ts and ignores other files", () => {
     const dir = mkdtempSync(join(tmpdir(), "simply-router-"))
     try {
-      writeFileSync(join(dir, "tokenharbor.txt"), "key-a\nkey-b\n\n", "utf8")
+      writeKeyFile(dir, "tokenharbor", [
+        { key: "key-a", status: "free" },
+        { key: "key-b", status: "free" },
+        { key: "key-c", status: "cooldown", cooldownUntil: new Date(Date.now() + COOLDOWN_MS).toISOString() },
+      ])
+      writeFileSync(join(dir, "ignored.txt"), "not loaded", "utf8")
       writeFileSync(join(dir, "notes.md"), "ignored", "utf8")
 
       const providers = loadProviderKeys(dir)
 
       expect([...providers.keys()]).toEqual(["tokenharbor"])
       expect(providers.get("tokenharbor")).toEqual(["key-a", "key-b"])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("expired cooldowns are persisted as free before keys are returned", () => {
+    const dir = mkdtempSync(join(tmpdir(), "simply-router-"))
+    try {
+      writeKeyFile(dir, "tokenharbor", [
+        { key: "expired-key", status: "cooldown", cooldownUntil: new Date(1_000).toISOString() },
+        { key: "active-key", status: "cooldown", cooldownUntil: new Date(10_000).toISOString() },
+      ])
+
+      expect(loadProviderKeys(dir, 1_000).get("tokenharbor")).toEqual(["expired-key"])
+      const saved = readFileSync(join(dir, "tokenharbor.ts"), "utf8")
+      expect(saved).toContain('"key": "expired-key",\n    "status": "free"')
+      expect(saved).toContain('"key": "active-key",\n    "status": "cooldown"')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not count any number of cooldown keys against free-key selection", () => {
+    const dir = mkdtempSync(join(tmpdir(), "simply-router-"))
+    try {
+      const cooldownUntil = new Date(Date.now() + COOLDOWN_MS).toISOString()
+      writeKeyFile(dir, "tokenharbor", [
+        ...Array.from({ length: 15 }, (_, index) => ({
+          key: `cooldown-${index}`,
+          status: "cooldown",
+          cooldownUntil,
+        })),
+        { key: "available", status: "free" },
+      ])
+
+      const providers = loadProviderKeys(dir)
+      expect(getNextAvailableKey(createRotator(providers.get("tokenharbor") ?? []))?.key).toBe("available")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("persists a seven-day cooldown and reset restores keys to free", () => {
+    const dir = mkdtempSync(join(tmpdir(), "simply-router-"))
+    try {
+      writeKeyFile(dir, "tokenharbor", [{ key: "key-a", status: "free" }])
+
+      persistProviderKeyCooldown(dir, "tokenharbor", "key-a", 1_000)
+
+      expect(loadProviderKeys(dir, 1_000 + COOLDOWN_MS - 1).get("tokenharbor")).toEqual([])
+      expect(loadProviderKeys(dir, 1_000 + COOLDOWN_MS).get("tokenharbor")).toEqual(["key-a"])
+
+      persistProviderKeyCooldown(dir, "tokenharbor", "key-a", 1_000)
+      resetProviderKeyFiles(dir)
+      expect(loadProviderKeys(dir, 1_000).get("tokenharbor")).toEqual(["key-a"])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
